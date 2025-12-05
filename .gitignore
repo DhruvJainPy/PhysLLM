@@ -3,8 +3,7 @@
 __pycache__/
 *.pyc
 
-# ignore model folder by git (but LFS will track files in it)
-Model/
+
 # also ignore large checkpoints not intended for LFS (optional)
 *.ckpt
 *.bin
