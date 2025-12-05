@@ -41,11 +41,12 @@ except Exception:
 GEMINI_MODEL = "gemma-3-12b-it"
 
 CLASSIFIER_DIR = Path(
-    r"../Model/distil_model"
+    r"/Users/dhruv/Desktop/Dhruv/DAIICT/Minor Project/PhysLLMMain/PhysLLM/Model/distil_model"
 )
-INDEX_PATH = r"../VectorStore/faiss_minilm_final.index"
-META_PATH = r"../VectorStore/faiss_minilm_final.pkl"
-EMBEDDER_PATH = Path(r"../Model/embedder_model"
+INDEX_PATH = r"/Users/dhruv/Desktop/Dhruv/DAIICT/Minor Project/PhysLLMMain/PhysLLM/VectorStore/faiss_minilm_final.index"
+META_PATH = r"/Users/dhruv/Desktop/Dhruv/DAIICT/Minor Project/PhysLLMMain/PhysLLM/VectorStore/faiss_minilm_final.pkl"
+EMBEDDER_PATH = Path(
+    r"/Users/dhruv/Desktop/Dhruv/DAIICT/Minor Project/PhysLLMMain/PhysLLM/Model/embedder_model"
 )
 MINILM_TOKENIZER_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
