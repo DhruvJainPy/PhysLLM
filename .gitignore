@@ -1,7 +1,10 @@
+# ignore general env / caches
 .env
+__pycache__/
+*.pyc
+
+# ignore model folder by git (but LFS will track files in it)
 Model/
-*.pt
-*.bin
-*.safetensors
+# also ignore large checkpoints not intended for LFS (optional)
 *.ckpt
-checkpoint-*/
+*.bin
