@@ -1,1 +1,7 @@
 .env
+Model/**/*.pt
+Model/**/*.bin
+Model/**/*.safetensors
+Model/**/*.ckpt
+Model/**/optimizer.pt
+Model/**/checkpoint-*/
