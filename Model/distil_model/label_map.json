@@ -1,0 +1,10 @@
+{
+  "label2id": {
+    "CONV_ONLY": 0,
+    "RAG_USEFUL": 1
+  },
+  "id2label": {
+    "0": "CONV_ONLY",
+    "1": "RAG_USEFUL"
+  }
+}
