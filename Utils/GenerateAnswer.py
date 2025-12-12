@@ -7,6 +7,7 @@ import pickle
 import warnings
 import zipfile
 import tarfile
+import gdown
 import shutil
 from pathlib import Path
 import functools
@@ -85,151 +86,163 @@ except Exception as e:
     # If you prefer non-fatal behavior, change this to set google_key = None
     raise
 
+DRIVE_ID_CLASSIFIER = "1OVwARmyn4DbSV4uO4Irq32swI7p_IAlN"
+DRIVE_ID_EMBEDDER  = "12ro3Y2CmuTmC0m-bC3dS0kNXNTgmKDuC"
+
+BASE_MODELS_DIR = Path("models")
+CLASSIFIER_DIR = BASE_MODELS_DIR / "classifier"
+EMBEDDER_DIR   = BASE_MODELS_DIR / "embedder"
+
+
+# ============================
+# Helper: ensure directory
+# ============================
+def _ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+
+# ============================================
+# Helper: download file from Google Drive
+# ============================================
+def _download_from_drive(file_id: str, out_path: Path):
+    url = f"https://drive.google.com/uc?id={file_id}"
+    _ensure_dir(out_path.parent)
+
+    if out_path.exists():
+        print(f"[download] Exists → {out_path}, skipping.")
+        return out_path
+
+    print(f"[download] Fetching {url} → {out_path}")
+    gdown.download(url, str(out_path), quiet=False)
+
+    if not out_path.exists():
+        raise RuntimeError(f"[download] FAILED → {out_path}")
+
+    print(f"[download] Completed → {out_path}")
+    return out_path
+
+
+# ===============================================================
+# Helper: auto-flatten extracted model folder
+# ===============================================================
+def _flatten_into(target_dir: Path):
+    """
+    If extraction created:
+        models/classifier/distil_model/...
+    Flatten so we end up with:
+        models/classifier/config.json
+    """
+    dirs = [d for d in target_dir.iterdir() if d.is_dir()]
+
+    # Case: exactly one nested directory (common in Drive zips)
+    if len(dirs) == 1:
+        inner = dirs[0]
+        print(f"[flatten] Flattening nested model folder: {inner.name}")
+
+        for item in inner.iterdir():
+            shutil.move(str(item), str(target_dir / item.name))
+
+        try:
+            inner.rmdir()
+        except:
+            pass
+
+
+# ===============================================================
+# Helper: extract archive (zip or tar), then auto-flatten
+# ===============================================================
+def _extract_archive(archive_path: Path, target_dir: Path):
+    _ensure_dir(target_dir)
+
+    # ZIP
+    if zipfile.is_zipfile(archive_path):
+        print(f"[extract] ZIP → {archive_path}")
+        with zipfile.ZipFile(archive_path, "r") as z:
+            z.extractall(target_dir)
+
+    # TAR
+    elif tarfile.is_tarfile(archive_path):
+        print(f"[extract] TAR → {archive_path}")
+        with tarfile.open(archive_path, "r:*") as t:
+            t.extractall(target_dir)
+
+    else:
+        raise RuntimeError(f"[extract] Not a zip/tar: {archive_path}")
+
+    # Flatten if needed
+    _flatten_into(target_dir)
+
+    # Show final structure
+    print("[extract] Final directory contents:", [p.name for p in target_dir.iterdir()])
+
+
+# ===============================================================
+# MAIN: Ensure classifier + embedder models exist
+# ===============================================================
+def ensure_models_downloaded(force=False):
+    _ensure_dir(BASE_MODELS_DIR)
+
+    # --------------------------
+    # CLASSIFIER
+    # --------------------------
+    if force or not CLASSIFIER_DIR.exists() or not any(CLASSIFIER_DIR.iterdir()):
+        print("[models] Downloading classifier model...")
+        archive = BASE_MODELS_DIR / "classifier.zip"
+        _download_from_drive(DRIVE_ID_CLASSIFIER, archive)
+        _extract_archive(archive, CLASSIFIER_DIR)
+
+        # Remove archive afterwards
+        try:
+            archive.unlink()
+        except:
+            pass
+
+    else:
+        print("[models] Classifier exists → skipping")
+
+    # --------------------------
+    # EMBEDDER
+    # --------------------------
+    if force or not EMBEDDER_DIR.exists() or not any(EMBEDDER_DIR.iterdir()):
+        print("[models] Downloading embedder model...")
+        archive = BASE_MODELS_DIR / "embedder.zip"
+        _download_from_drive(DRIVE_ID_EMBEDDER, archive)
+        _extract_archive(archive, EMBEDDER_DIR)
+
+        try:
+            archive.unlink()
+        except:
+            pass
+
+    else:
+        print("[models] Embedder exists → skipping")
+
+    print("[models] All models ready.")
+
+
+# ===============================================================
+# Run at import time
+# ===============================================================
+try:
+    ensure_models_downloaded()
+except Exception as e:
+    print("❌ MODEL DOWNLOAD FAILED:", e)
+    raise
+
+
 # ================================================================
 # CONFIGURATION & PATHS (now dynamic: models downloaded at runtime)
 # ================================================================
 GEMINI_MODEL = "gemma-3-12b-it"
 MINILM_TOKENIZER_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
-# Google Drive file IDs you provided (classifier, embedder)
-# These IDs were taken from your provided links:
-# https://drive.google.com/file/d/<ID>/view?usp=...
-DRIVE_ID_CLASSIFIER = "1RbbMdpUKBhwRyv5s0ICJiBQGNAUBWSsX"
-DRIVE_ID_EMBEDDER = "1rxn7AhE4VFi6xEIcXIvTHFpsPAOSfR3Z"
-# If you later have FAISS / metadata as Drive files, add them here similarly:
-DRIVE_ID_FAISS = None
-DRIVE_ID_METADATA = None
-
-# Local model storage (relative to repo root)
-BASE_MODELS_DIR = Path("models")
 VECTOR_STORE_DIR = Path("VectorStore")
-
-CLASSIFIER_DIR = BASE_MODELS_DIR / "classifier"
-EMBEDDER_PATH = BASE_MODELS_DIR / "embedder"
 
 # FAISS / metadata paths (can be downloaded separately if you add Drive IDs)
 INDEX_PATH = VECTOR_STORE_DIR / "faiss_minilm_final.index"
 META_PATH = VECTOR_STORE_DIR / "faiss_metadata.pkl"
 
-# ================================================================
-# Utilities: download from Google Drive and extract
-# ================================================================
-def _ensure_dir(p: Path):
-    p.mkdir(parents=True, exist_ok=True)
-
-def _download_drive_file(file_id: str, out_path: Path, quiet: bool = False):
-    """
-    Download a file from Google Drive using gdown.
-    If gdown not installed, raise informative error.
-    """
-    try:
-        import gdown
-    except Exception as e:
-        raise RuntimeError("gdown is required to download files from Google Drive. Install it via `pip install gdown`.") from e
-
-    url = f"https://drive.google.com/uc?id={file_id}"
-    # gdown will write to out_path; we ensure parent exists
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.exists():
-        print(f"[download] already exists: {out_path}, skipping download.")
-        return out_path
-    print(f"[download] fetching {url} -> {out_path} ...")
-    # we use gdown.download with output
-    gdown.download(url, str(out_path), quiet=quiet)
-    if not out_path.exists():
-        raise RuntimeError(f"Download failed, file not found at {out_path}")
-    print(f"[download] completed: {out_path} (size: {out_path.stat().st_size} bytes)")
-    return out_path
-
-def _extract_archive_if_needed(archive_path: Path, target_dir: Path):
-    """
-    If archive_path is a zip or tar, extract into target_dir.
-    If not archive, move the file into target_dir preserving filename.
-    """
-    _ensure_dir(target_dir)
-    # ZIP
-    if zipfile.is_zipfile(archive_path):
-        print(f"[extract] {archive_path} is a zip, extracting to {target_dir}")
-        with zipfile.ZipFile(archive_path, "r") as zf:
-            zf.extractall(target_dir)
-        return True
-    # TAR
-    try:
-        if tarfile.is_tarfile(archive_path):
-            print(f"[extract] {archive_path} is a tar archive, extracting to {target_dir}")
-            with tarfile.open(archive_path, "r:*") as tf:
-                tf.extractall(target_dir)
-            return True
-    except Exception:
-        pass
-
-    # Not an archive: move the single file into target_dir
-    dest = target_dir / archive_path.name
-    if dest.exists():
-        print(f"[extract] destination exists {dest}, skipping move")
-    else:
-        print(f"[extract] moving {archive_path} -> {dest}")
-        shutil.move(str(archive_path), str(dest))
-    return False
-
-def ensure_models_downloaded(force: bool = False):
-    """
-    Ensure classifier and embedder models are present on disk.
-    Downloads from Google Drive if not present.
-    """
-    _ensure_dir(BASE_MODELS_DIR)
-
-    # Classifier
-    if DRIVE_ID_CLASSIFIER is None:
-        print("[ensure_models] DRIVE_ID_CLASSIFIER not provided; skipping classifier download")
-    else:
-        if force or not CLASSIFIER_DIR.exists() or not any(CLASSIFIER_DIR.iterdir()):
-            print("[ensure_models] Downloading classifier model from Google Drive...")
-            classifier_archive = BASE_MODELS_DIR / "classifier_download"
-            # prefer zip extension for downloaded file name to allow extraction
-            classifier_archive_zip = classifier_archive.with_suffix(".zip")
-            _download_drive_file(DRIVE_ID_CLASSIFIER, classifier_archive_zip)
-            _extract_archive_if_needed(classifier_archive_zip, CLASSIFIER_DIR)
-            # remove the archive file if it still exists
-            if classifier_archive_zip.exists():
-                try:
-                    classifier_archive_zip.unlink()
-                except Exception:
-                    pass
-            print(f"[ensure_models] Classifier available at: {CLASSIFIER_DIR}")
-        else:
-            print(f"[ensure_models] Classifier already present at {CLASSIFIER_DIR}, skipping download")
-
-    # Embedder
-    if DRIVE_ID_EMBEDDER is None:
-        print("[ensure_models] DRIVE_ID_EMBEDDER not provided; skipping embedder download")
-    else:
-        if force or not EMBEDDER_PATH.exists() or not any(EMBEDDER_PATH.iterdir()):
-            print("[ensure_models] Downloading embedder model from Google Drive...")
-            embedder_archive = BASE_MODELS_DIR / "embedder_download"
-            embedder_archive_zip = embedder_archive.with_suffix(".zip")
-            _download_drive_file(DRIVE_ID_EMBEDDER, embedder_archive_zip)
-            _extract_archive_if_needed(embedder_archive_zip, EMBEDDER_PATH)
-            if embedder_archive_zip.exists():
-                try:
-                    embedder_archive_zip.unlink()
-                except Exception:
-                    pass
-            print(f"[ensure_models] Embedder available at: {EMBEDDER_PATH}")
-        else:
-            print(f"[ensure_models] Embedder already present at {EMBEDDER_PATH}, skipping download")
-
-    # If FAISS/META drive ids are provided, you can add similar logic here.
-
-# Attempt to download models now (this runs at import/cold-start time)
-# It's useful for deployment logs to see this happen.
-try:
-    ensure_models_downloaded()
-except Exception as e:
-    # Fail fast so deployment logs show the issue - avoids obscure downstream errors.
-    print("[ERROR] Failed to ensure models downloaded:", e)
-    raise
-
+    
 # ================================================================
 # CACHED LOADERS (tokenizer/model, label_map, faiss, embeddings/LLM)
 # ================================================================
