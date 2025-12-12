@@ -1,3 +1,4 @@
 Models/ # DO NOT commit models
 *.safetensors
 *.pt
+.env
