@@ -1,9 +1,3 @@
-# ignore general env / caches
-.env
-__pycache__/
-*.pyc
-
-
-# also ignore large checkpoints not intended for LFS (optional)
-*.ckpt
-*.bin
+Models/ # DO NOT commit models
+*.safetensors
+*.pt

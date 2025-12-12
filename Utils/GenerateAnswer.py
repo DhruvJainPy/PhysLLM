@@ -50,6 +50,7 @@ EMBEDDER_PATH = Path(
 )
 MINILM_TOKENIZER_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
+google_key = st.secrets["GOOGLE_API_KEY"]
 
 if not CLASSIFIER_DIR.exists():
     raise FileNotFoundError(f"Classifier directory not found: {CLASSIFIER_DIR}")
