@@ -1,14 +1,19 @@
+# physllm_app.py  (updated full file)
 import os
 import re
 import json
 import torch
 import pickle
 import warnings
+import zipfile
+import tarfile
+import shutil
 from pathlib import Path
 import functools
 from dotenv import load_dotenv
 from transformers import AutoTokenizer, AutoModel
 
+# Load .env for local dev fallback
 load_dotenv()
 
 # ====== Force single-threaded BLAS/OpenMP for safety (helps avoid segfaults) ======
@@ -35,28 +40,195 @@ except Exception:
     def _cache_data(fn):
         return functools.lru_cache(maxsize=1)(fn)
 
+# ----------------- Render / Streamlit secrets helper -----------------
+def get_secret(key: str) -> str:
+    """
+    Robust secret loader:
+    1) Try streamlit secrets (st.secrets) if available
+    2) Then OS environment variables (Render exposes secrets as env vars)
+    3) Then dotenv / os.getenv (local development)
+    Raises RuntimeError if secret not found.
+    """
+    # 1) Try streamlit secrets if streamlit is imported and has secrets
+    try:
+        import streamlit as _st
+        try:
+            val = _st.secrets.get(key) if hasattr(_st, "secrets") else None
+        except Exception:
+            val = None
+        if val:
+            return val
+    except Exception:
+        # streamlit not available or import failed; continue to next source
+        pass
+
+    # 2) Check environment variables (Render uses env vars)
+    val = os.environ.get(key)
+    if val:
+        return val
+
+    # 3) Check dotenv / os.getenv (already loaded by load_dotenv earlier)
+    val = os.getenv(key)
+    if val:
+        return val
+
+    # Not found — raise to make the failure visible in logs
+    raise RuntimeError(
+        f"Missing secret: {key}. Set it in Render environment variables, "
+        "or in Streamlit secrets (.streamlit/secrets.toml), or in your .env file for local dev."
+    )
+
+# Use the helper to obtain GOOGLE_API_KEY (works in Render)
+try:
+    google_key = get_secret("GOOGLE_API_KEY")
+except Exception as e:
+    # If you prefer non-fatal behavior, change this to set google_key = None
+    raise
+
 # ================================================================
-# CONFIGURATION & PATHS
+# CONFIGURATION & PATHS (now dynamic: models downloaded at runtime)
 # ================================================================
 GEMINI_MODEL = "gemma-3-12b-it"
-
-CLASSIFIER_DIR = Path(
-    r"/../Model/distil_model"
-)
-INDEX_PATH = r"/../VectorStore/faiss_minilm_final.index"
-META_PATH = r"/../VectorStore/faiss_minilm_final.pkl"
-EMBEDDER_PATH = Path(
-    r"/../Model/embedder_model"
-)
 MINILM_TOKENIZER_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
-google_key = st.secrets["GOOGLE_API_KEY"]
+# Google Drive file IDs you provided (classifier, embedder)
+# These IDs were taken from your provided links:
+# https://drive.google.com/file/d/<ID>/view?usp=...
+DRIVE_ID_CLASSIFIER = "1RbbMdpUKBhwRyv5s0ICJiBQGNAUBWSsX"
+DRIVE_ID_EMBEDDER = "1rxn7AhE4VFi6xEIcXIvTHFpsPAOSfR3Z"
+# If you later have FAISS / metadata as Drive files, add them here similarly:
+DRIVE_ID_FAISS = None
+DRIVE_ID_METADATA = None
 
-if not CLASSIFIER_DIR.exists():
-    raise FileNotFoundError(f"Classifier directory not found: {CLASSIFIER_DIR}")
+# Local model storage (relative to repo root)
+BASE_MODELS_DIR = Path("models")
+VECTOR_STORE_DIR = Path("VectorStore")
 
-if not EMBEDDER_PATH.exists():
-    raise FileNotFoundError(f"Embedder model directory not found: {EMBEDDER_PATH}")
+CLASSIFIER_DIR = BASE_MODELS_DIR / "classifier"
+EMBEDDER_PATH = BASE_MODELS_DIR / "embedder"
+
+# FAISS / metadata paths (can be downloaded separately if you add Drive IDs)
+INDEX_PATH = VECTOR_STORE_DIR / "faiss_minilm_final.index"
+META_PATH = VECTOR_STORE_DIR / "faiss_metadata.pkl"
+
+# ================================================================
+# Utilities: download from Google Drive and extract
+# ================================================================
+def _ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+def _download_drive_file(file_id: str, out_path: Path, quiet: bool = False):
+    """
+    Download a file from Google Drive using gdown.
+    If gdown not installed, raise informative error.
+    """
+    try:
+        import gdown
+    except Exception as e:
+        raise RuntimeError("gdown is required to download files from Google Drive. Install it via `pip install gdown`.") from e
+
+    url = f"https://drive.google.com/uc?id={file_id}"
+    # gdown will write to out_path; we ensure parent exists
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.exists():
+        print(f"[download] already exists: {out_path}, skipping download.")
+        return out_path
+    print(f"[download] fetching {url} -> {out_path} ...")
+    # we use gdown.download with output
+    gdown.download(url, str(out_path), quiet=quiet)
+    if not out_path.exists():
+        raise RuntimeError(f"Download failed, file not found at {out_path}")
+    print(f"[download] completed: {out_path} (size: {out_path.stat().st_size} bytes)")
+    return out_path
+
+def _extract_archive_if_needed(archive_path: Path, target_dir: Path):
+    """
+    If archive_path is a zip or tar, extract into target_dir.
+    If not archive, move the file into target_dir preserving filename.
+    """
+    _ensure_dir(target_dir)
+    # ZIP
+    if zipfile.is_zipfile(archive_path):
+        print(f"[extract] {archive_path} is a zip, extracting to {target_dir}")
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            zf.extractall(target_dir)
+        return True
+    # TAR
+    try:
+        if tarfile.is_tarfile(archive_path):
+            print(f"[extract] {archive_path} is a tar archive, extracting to {target_dir}")
+            with tarfile.open(archive_path, "r:*") as tf:
+                tf.extractall(target_dir)
+            return True
+    except Exception:
+        pass
+
+    # Not an archive: move the single file into target_dir
+    dest = target_dir / archive_path.name
+    if dest.exists():
+        print(f"[extract] destination exists {dest}, skipping move")
+    else:
+        print(f"[extract] moving {archive_path} -> {dest}")
+        shutil.move(str(archive_path), str(dest))
+    return False
+
+def ensure_models_downloaded(force: bool = False):
+    """
+    Ensure classifier and embedder models are present on disk.
+    Downloads from Google Drive if not present.
+    """
+    _ensure_dir(BASE_MODELS_DIR)
+
+    # Classifier
+    if DRIVE_ID_CLASSIFIER is None:
+        print("[ensure_models] DRIVE_ID_CLASSIFIER not provided; skipping classifier download")
+    else:
+        if force or not CLASSIFIER_DIR.exists() or not any(CLASSIFIER_DIR.iterdir()):
+            print("[ensure_models] Downloading classifier model from Google Drive...")
+            classifier_archive = BASE_MODELS_DIR / "classifier_download"
+            # prefer zip extension for downloaded file name to allow extraction
+            classifier_archive_zip = classifier_archive.with_suffix(".zip")
+            _download_drive_file(DRIVE_ID_CLASSIFIER, classifier_archive_zip)
+            _extract_archive_if_needed(classifier_archive_zip, CLASSIFIER_DIR)
+            # remove the archive file if it still exists
+            if classifier_archive_zip.exists():
+                try:
+                    classifier_archive_zip.unlink()
+                except Exception:
+                    pass
+            print(f"[ensure_models] Classifier available at: {CLASSIFIER_DIR}")
+        else:
+            print(f"[ensure_models] Classifier already present at {CLASSIFIER_DIR}, skipping download")
+
+    # Embedder
+    if DRIVE_ID_EMBEDDER is None:
+        print("[ensure_models] DRIVE_ID_EMBEDDER not provided; skipping embedder download")
+    else:
+        if force or not EMBEDDER_PATH.exists() or not any(EMBEDDER_PATH.iterdir()):
+            print("[ensure_models] Downloading embedder model from Google Drive...")
+            embedder_archive = BASE_MODELS_DIR / "embedder_download"
+            embedder_archive_zip = embedder_archive.with_suffix(".zip")
+            _download_drive_file(DRIVE_ID_EMBEDDER, embedder_archive_zip)
+            _extract_archive_if_needed(embedder_archive_zip, EMBEDDER_PATH)
+            if embedder_archive_zip.exists():
+                try:
+                    embedder_archive_zip.unlink()
+                except Exception:
+                    pass
+            print(f"[ensure_models] Embedder available at: {EMBEDDER_PATH}")
+        else:
+            print(f"[ensure_models] Embedder already present at {EMBEDDER_PATH}, skipping download")
+
+    # If FAISS/META drive ids are provided, you can add similar logic here.
+
+# Attempt to download models now (this runs at import/cold-start time)
+# It's useful for deployment logs to see this happen.
+try:
+    ensure_models_downloaded()
+except Exception as e:
+    # Fail fast so deployment logs show the issue - avoids obscure downstream errors.
+    print("[ERROR] Failed to ensure models downloaded:", e)
+    raise
 
 # ================================================================
 # CACHED LOADERS (tokenizer/model, label_map, faiss, embeddings/LLM)
@@ -65,8 +237,11 @@ if not EMBEDDER_PATH.exists():
 def load_classifier(classifier_dir=CLASSIFIER_DIR):
     """Load tokenizer and classifier model once (cached)."""
     from transformers import AutoTokenizer, AutoModelForSequenceClassification
-    tok = AutoTokenizer.from_pretrained(classifier_dir)
-    model = AutoModelForSequenceClassification.from_pretrained(classifier_dir)
+    # classifier_dir may be a folder path or contain a single file; AutoTokenizer expects a folder or HF repo.
+    if not Path(classifier_dir).exists():
+        raise FileNotFoundError(f"Classifier directory not found: {classifier_dir}")
+    tok = AutoTokenizer.from_pretrained(str(classifier_dir))
+    model = AutoModelForSequenceClassification.from_pretrained(str(classifier_dir))
     model.eval()
     return tok, model
 
@@ -74,7 +249,7 @@ def load_classifier(classifier_dir=CLASSIFIER_DIR):
 @_cache_data
 def load_label_map(classifier_dir=CLASSIFIER_DIR):
     """Load label map (cached)."""
-    p = classifier_dir / "label_map.json"
+    p = Path(classifier_dir) / "label_map.json"
     if not p.exists():
         return {}
     with open(p, "r", encoding="utf-8") as f:
@@ -92,7 +267,11 @@ def load_label_map(classifier_dir=CLASSIFIER_DIR):
 def load_faiss_index_and_metadata(index_path=INDEX_PATH, meta_path=META_PATH):
     """Load FAISS index and metadata (cached)."""
     import faiss
-    index = faiss.read_index(index_path)
+    if not Path(index_path).exists():
+        raise FileNotFoundError(f"FAISS index not found: {index_path}")
+    index = faiss.read_index(str(index_path))
+    if not Path(meta_path).exists():
+        raise FileNotFoundError(f"FAISS metadata file not found: {meta_path}")
     with open(meta_path, "rb") as f:
         metadata = pickle.load(f)
     
@@ -173,7 +352,9 @@ def load_embedding_and_llm_clients(gemini_model=GEMINI_MODEL):
     from langchain_google_genai import ChatGoogleGenerativeAI
 
     minilm_tokenizer = AutoTokenizer.from_pretrained(MINILM_TOKENIZER_NAME)
-    embeddings_client = AutoModel.from_pretrained(EMBEDDER_PATH)
+    if not Path(EMBEDDER_PATH).exists():
+        raise FileNotFoundError(f"Embedder model directory not found: {EMBEDDER_PATH}")
+    embeddings_client = AutoModel.from_pretrained(str(EMBEDDER_PATH))
     embeddings_client.eval()
     
     llm_client = ChatGoogleGenerativeAI(
@@ -198,6 +379,7 @@ except Exception:
 # ================================================================
 # Populate module-level objects using cached loaders
 # ================================================================
+# These calls will use the downloaded model folders (ensured earlier)
 clf_tokenizer, clf_model = load_classifier()
 id2label = load_label_map()
 index, texts, topics = load_faiss_index_and_metadata()
@@ -210,9 +392,9 @@ def classify_query(query: str) -> str:
     """Classify query into predefined labels."""
     encoded = clf_tokenizer(query, return_tensors="pt", truncation=True, max_length=128)
     clf_model.eval()
-    with _torch.no_grad():
+    with torch.no_grad():
         outputs = clf_model(**encoded)
-        pred = int(_torch.argmax(outputs.logits, dim=-1).item())
+        pred = int(torch.argmax(outputs.logits, dim=-1).item())
     return id2label.get(pred, str(pred))
 
 
@@ -339,65 +521,6 @@ def retrieve_candidates_faiss(query, fetch_k=10):
         print(f" rank={r['rank']} chunk_id={r['chunk_id']} faiss_score={r['faiss_score']:.4f}")
 
     return results
-
-# def cross_encode_and_rank(query, candidates, truncate_chars=900):
-#     """Rescore retrieved candidates using LLM for relevance."""
-#     if not candidates:
-#         return []
-
-#     snippet_lines = [
-#         f"{c['rank']} :: ChunkID: {c['chunk_id']} :: Topic: {c['topic']} :: {c['text'].replace(chr(10), ' ')[:truncate_chars]}"
-#         for c in candidates
-#     ]
-#     block = "\n\n".join(snippet_lines)
-
-#     prompt = f"""
-# You are a strict NCERT-snippet relevance judge. Score each snippet from 0.0 to 1.0 for relevance to the question.
-# Output EXACTLY lines in the format: rank:score
-
-# Question: {query}
-# Snippets: {block}
-# Scores:
-# """
-#     resp = llm.invoke(prompt)
-#     resp_text = resp.content if hasattr(resp, "content") else str(resp)
-
-#     scores = {}
-#     for line in resp_text.splitlines():
-#         if ":" not in line:
-#             continue
-#         try:
-#             left, right = line.split(":", 1)
-#             r = int(left.strip())
-#             # extract first decimal or integer from right
-#             s = float(re.findall(r"[-+]?\d*\.\d+|\d+", right.strip())[0])
-#             scores[r] = max(0.0, min(1.0, s))
-#         except Exception:
-#             continue
-
-#     # Fallback to normalized FAISS scores if parsing fails for enough entries
-#     if len(scores) < max(1, len(candidates)//3):
-#         vals = [c["faiss_score"] for c in candidates]
-#         min_s, max_s = (min(vals), max(vals)) if vals else (0.0, 1.0)
-#         rng = max_s - min_s if max_s != min_s else 1.0
-#         for c in candidates:
-#             r = c["rank"]
-#             if r not in scores:
-#                 scores[r] = (c["faiss_score"] - min_s) / rng
-
-#     ranked = []
-#     for c in candidates:
-#         c2 = c.copy()
-#         c2["llm_score"] = scores.get(c["rank"], 0.0)
-#         ranked.append(c2)
-
-#     ranked.sort(key=lambda x: x["llm_score"], reverse=True)
-
-#     print("[cross_encode] top ranks after re-score:")
-#     for rr in ranked[:5]:
-#         print(f" rank={rr['rank']} chunk_id={rr['chunk_id']} llm_score={rr['llm_score']:.3f}")
-
-#     return ranked
 
 def retrieve_similar_chunks(query, k=10, fetch_k=10):
     """Retrieve top-k most relevant chunks for a query."""
